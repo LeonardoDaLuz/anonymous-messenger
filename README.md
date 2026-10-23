@@ -8,7 +8,11 @@ Messenger anônimo com mensagens criptografadas ponta a ponta (AES-256-GCM no na
 docker compose up --build
 ```
 
-Acesse http://localhost:3045 (API direta em http://localhost:3046, só na máquina local; WebCrypto exige `localhost` ou HTTPS).
+Acesse https://sysware.com.br/anonymous-messenger/. O Nginx do host termina o TLS e encaminha esse caminho para o frontend em `http://127.0.0.1:3045` (API direta em http://localhost:3046, só na máquina local).
+
+Para desenvolvimento sem o Nginx do host, o frontend fica disponível em http://localhost:3045/anonymous-messenger/; WebCrypto funciona em `localhost` ou via HTTPS.
+
+As `location`s usadas em produção estão em `deploy/nginx/anonymous-messenger.location.conf`. Esse arquivo deve ser incluído no bloco HTTPS de `sysware.com.br`.
 
 ## Como funciona
 

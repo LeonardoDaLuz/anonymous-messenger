@@ -13,7 +13,8 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3045:80"
+      # A porta fica restrita ao host; o acesso público passa pelo Nginx HTTPS.
+      - "127.0.0.1:3045:80"
     depends_on:
       - backend
     restart: unless-stopped

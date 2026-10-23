@@ -1,9 +1,10 @@
 // A sessão vai em cookie HttpOnly: o JS da página nunca enxerga o token.
 let onUnauthorized = () => {};
 export const setUnauthorizedHandler = (fn) => { onUnauthorized = fn; };
+const basePath = import.meta.env.BASE_URL.replace(/\/$/, '');
 
 async function request(method, path, body) {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${basePath}/api${path}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,

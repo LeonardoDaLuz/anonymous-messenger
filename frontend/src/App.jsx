@@ -235,7 +235,8 @@ function Messenger({ me, onLogout }) {
     let delay = 1000;
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      const basePath = import.meta.env.BASE_URL.replace(/\/$/, '');
+      ws = new WebSocket(`${proto}://${location.host}${basePath}/ws`);
       ws.onopen = () => { delay = 1000; };
       ws.onmessage = (e) => {
         const ev = JSON.parse(e.data);
