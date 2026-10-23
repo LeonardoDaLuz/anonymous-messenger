@@ -7,7 +7,7 @@ button.link { background: none; border: none; color: #8ab4ff; padding: 0; }
 .error { color: #ff7b7b; margin: 6px 0; }
 
 .auth { max-width: 320px; margin: 15vh auto; display: flex; flex-direction: column; gap: 10px; }
-.app { display: flex; height: 100vh; }
+.app { display: flex; height: 100vh; height: 100dvh; }
 aside { width: 260px; border-right: 1px solid #2c333b; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 aside form input { width: 100%; }
 aside .me { display: flex; justify-content: space-between; align-items: center; }
@@ -38,3 +38,20 @@ button.danger { color: #ff7b7b; }
 .blocked { font-size: 13px; opacity: .85; }
 .chat header strong { flex: 1; }
 .msg img { display: block; max-width: 100%; max-height: 360px; border-radius: 6px; }
+.msg img { cursor: zoom-in; }
+.notice { margin: 0; padding: 8px 12px; font-size: 12px; opacity: .8; background: #1b2026; border-bottom: 1px solid #2a3038; }
+.lightbox { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .9); cursor: zoom-out; }
+.lightbox img { max-width: 95vw; max-height: 95vh; }
+button.back { display: none; font-size: 20px; }
+
+@media (max-width: 700px) {
+  aside { width: 100%; border-right: none; }
+  .chat.empty { display: none; }
+  .app.in-chat aside { display: none; }
+  button.back { display: block; }
+  .chat header { flex-wrap: wrap; gap: 8px; }
+  .chat header input { flex-basis: 100%; order: 10; }
+  .msg { max-width: 85%; }
+  input, button { font-size: 16px; } /* evita o zoom automático do iOS */
+  .composer { padding-bottom: calc(12px + env(safe-area-inset-bottom)); }
+}

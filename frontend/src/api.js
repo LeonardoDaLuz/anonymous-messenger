@@ -35,5 +35,6 @@ export const api = {
   block: (login) => request('POST', `/blocks/${enc(login)}`),
   unblock: (login) => request('DELETE', `/blocks/${enc(login)}`),
   messages: (friend) => request('GET', `/messages/${enc(friend)}`),
+  clearMessages: (friend) => request('DELETE', `/messages/${enc(friend)}`),
   send: (friend, data) => request('POST', `/messages/${enc(friend)}`, { data }),
 };

@@ -10,15 +10,12 @@ const scrypt = promisify(crypto.scrypt);
 
 const PORT = Number(process.env.PORT) || 3000;
 const DB_PATH = process.env.DB_PATH || './app.db';
-const MAX_MESSAGES = Number(process.env.MAX_MESSAGES) || 100; // por conversa
-const MAX_MEMORY_BYTES = Number(process.env.MAX_MEMORY_BYTES) || 64 * 1024 * 1024; // total de mensagens
 const MAX_USERS = Number(process.env.MAX_USERS) || 10000;
 const MIN_PASSWORD = 6; // só no cadastro; o login aceita contas antigas
 const MAX_FRIENDS = 500;
 const MAX_PENDING_REQUESTS = 100; // pedidos recebidos simultâneos por usuário
 const MAX_SOCKETS_PER_USER = 10;
 const MAX_CIPHERTEXT = 1024 * 1024; // cabe uma imagem colada (base64 + AES-GCM)
-const MAX_CONVERSATION_BYTES = 16 * 1024 * 1024;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const COOKIE = 'sid';
 
@@ -51,6 +48,15 @@ db.exec(`
     user_id INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    conv TEXT NOT NULL,
+    from_id INTEGER NOT NULL,
+    to_id INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    ts INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS messages_conv_ts ON messages (conv, ts);
 `);
 
 const q = {
@@ -88,6 +94,14 @@ const q = {
      WHERE r.to_id = ? ORDER BY u.login`
   ),
   countIncoming: db.prepare('SELECT COUNT(*) AS n FROM friend_requests WHERE to_id = ?'),
+
+  insertMessage: db.prepare('INSERT INTO messages (id, conv, from_id, to_id, data, ts) VALUES (?, ?, ?, ?, ?, ?)'),
+  messagesOf: db.prepare(
+    `SELECT m.id, a.login AS "from", b.login AS "to", m.data, m.ts
+     FROM messages m JOIN users a ON a.id = m.from_id JOIN users b ON b.id = m.to_id
+     WHERE m.conv = ? ORDER BY m.ts, m.rowid`
+  ),
+  deleteMessages: db.prepare('DELETE FROM messages WHERE conv = ?'),
 
   insertBlock: db.prepare('INSERT OR IGNORE INTO blocks (user_id, blocked_id) VALUES (?, ?)'),
   deleteBlock: db.prepare('DELETE FROM blocks WHERE user_id = ? AND blocked_id = ?'),
@@ -159,38 +173,8 @@ function startSession(req, res, user) {
 
 setInterval(() => q.purgeSessions.run(Date.now()), 60 * 60 * 1000).unref();
 
-// ---------- mensagens (apenas em memória) ----------
-// conversa -> { messages: [{ id, from, to, data, ts }], bytes }. A ordem do Map é a de uso recente.
-const conversations = new Map();
-let totalBytes = 0;
-const convKey = (a, b) => JSON.stringify([a, b].sort());
-
-function dropConversation(key) {
-  const conv = conversations.get(key);
-  if (!conv) return;
-  totalBytes -= conv.bytes;
-  conversations.delete(key);
-}
-
-function storeMessage(msg) {
-  const key = convKey(msg.from, msg.to);
-  const conv = conversations.get(key) ?? { messages: [], bytes: 0 };
-  conversations.delete(key);
-  conv.messages.push(msg);
-  conv.bytes += msg.data.length;
-  totalBytes += msg.data.length;
-  while (conv.messages.length > MAX_MESSAGES || (conv.bytes > MAX_CONVERSATION_BYTES && conv.messages.length > 1)) {
-    const old = conv.messages.shift();
-    conv.bytes -= old.data.length;
-    totalBytes -= old.data.length;
-  }
-  conversations.set(key, conv);
-  // Acima do teto global de memória, descarta as conversas usadas há mais tempo.
-  for (const k of conversations.keys()) {
-    if (totalBytes <= MAX_MEMORY_BYTES || k === key) break;
-    dropConversation(k);
-  }
-}
+// ---------- mensagens (SQLite; só texto cifrado) ----------
+const convKey = (idA, idB) => (idA < idB ? `${idA}:${idB}` : `${idB}:${idA}`);
 
 // ---------- tempo real ----------
 const sockets = new Map(); // login -> Set<WebSocket>
@@ -399,7 +383,7 @@ app.delete('/api/friends/:login', auth, (req, res) => {
   const friend = otherUser(req, res);
   if (!friend) return;
   q.removeFriend.run(req.user.id, friend.id);
-  dropConversation(convKey(req.user.login, friend.login));
+  q.deleteMessages.run(convKey(req.user.id, friend.id));
   push(friend.login, { type: 'friend' });
   res.json({});
 });
@@ -412,7 +396,7 @@ app.post('/api/blocks/:login', auth, (req, res) => {
     q.deleteRequestsBetween.run(req.user.id, target.id);
     q.insertBlock.run(req.user.id, target.id);
   });
-  dropConversation(convKey(req.user.login, target.login));
+  q.deleteMessages.run(convKey(req.user.id, target.id));
   push(target.login, { type: 'friend' });
   res.json({});
 });
@@ -436,7 +420,7 @@ function friendOf(req, res) {
 app.get('/api/messages/:friend', auth, (req, res) => {
   const friend = friendOf(req, res);
   if (!friend) return;
-  res.json(conversations.get(convKey(req.user.login, friend.login))?.messages ?? []);
+  res.json(q.messagesOf.all(convKey(req.user.id, friend.id)));
 });
 
 // `data` já chega criptografado (AES-GCM) pelo navegador; o servidor nunca vê o texto.
@@ -448,10 +432,20 @@ app.post('/api/messages/:friend', auth, limitSend, (req, res) => {
     return res.status(400).json({ error: 'Mensagem inválida' });
   }
   const msg = { id: crypto.randomUUID(), from: req.user.login, to: friend.login, data, ts: Date.now() };
-  storeMessage(msg);
+  q.insertMessage.run(msg.id, convKey(req.user.id, friend.id), req.user.id, friend.id, data, msg.ts);
   push(msg.from, { type: 'message', message: msg });
   push(msg.to, { type: 'message', message: msg });
   res.json(msg);
+});
+
+// Apaga a conversa inteira para os dois lados, de forma permanente.
+app.delete('/api/messages/:friend', auth, (req, res) => {
+  const friend = friendOf(req, res);
+  if (!friend) return;
+  q.deleteMessages.run(convKey(req.user.id, friend.id));
+  push(req.user.login, { type: 'cleared', with: friend.login });
+  push(friend.login, { type: 'cleared', with: req.user.login });
+  res.json({});
 });
 
 app.use((err, req, res, next) => {

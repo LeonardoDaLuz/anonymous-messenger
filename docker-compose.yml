@@ -6,7 +6,6 @@ services:
     environment:
       - PORT=3000
       - DB_PATH=/data/app.db
-      - MAX_MESSAGES=${MAX_MESSAGES:-100}
     volumes:
       - db-data:/data
     restart: unless-stopped

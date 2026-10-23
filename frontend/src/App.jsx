@@ -36,11 +36,12 @@ function AuthScreen({ onAuth }) {
   );
 }
 
-function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock }) {
+function Chat({ me, friend, secret, onSecretChange, incoming, cleared, onBack, onRemove, onBlock }) {
   const [raw, setRaw] = useState([]);
   const [plain, setPlain] = useState({});
   const [text, setText] = useState('');
   const [error, setError] = useState('');
+  const [zoom, setZoom] = useState(null);
   const bottom = useRef(null);
 
   useEffect(() => {
@@ -49,10 +50,14 @@ function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock 
   }, [friend]);
 
   useEffect(() => {
+    if (cleared > 0) setRaw([]);
+  }, [cleared]);
+
+  useEffect(() => {
     if (!incoming) return;
     const { from, to } = incoming;
     if ((from === friend && to === me) || (from === me && to === friend)) {
-      setRaw((prev) => (prev.some((m) => m.id === incoming.id) ? prev : [...prev.slice(-99), incoming]));
+      setRaw((prev) => (prev.some((m) => m.id === incoming.id) ? prev : [...prev, incoming]));
     }
   }, [incoming, friend, me]);
 
@@ -95,19 +100,31 @@ function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock 
     }
   };
 
+  const clear = async () => {
+    if (!window.confirm(`Apagar permanentemente todas as mensagens com ${friend}? Isso apaga para os dois lados e não pode ser desfeito.`)) return;
+    setError('');
+    try {
+      await api.clearMessages(friend);
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   const show = (m) => {
     if (!secret) return <em className="locked">🔒 {m.data.slice(0, 40)}…</em>;
     if (plain[m.id] === undefined) return '…';
     const p = plain[m.id];
     if (p == null) return <em className="locked">🔒 chave incorreta</em>;
-    return IMAGE_RE.test(p) ? <img src={p} alt="imagem" /> : p;
+    return IMAGE_RE.test(p) ? <img src={p} alt="imagem" onClick={() => setZoom(p)} /> : p;
   };
 
   return (
     <section className="chat">
       <header>
+        <button type="button" className="link back" onClick={onBack}>←</button>
         <strong>{friend}</strong>
         <button type="button" className="link" onClick={onRemove}>Remover</button>
+        <button type="button" className="link danger" onClick={clear}>Limpar chat</button>
         <button type="button" className="link danger" onClick={onBlock}>Bloquear</button>
         <input
           type="password"
@@ -116,6 +133,12 @@ function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock 
           onChange={(e) => onSecretChange(e.target.value)}
         />
       </header>
+      <p className="notice">
+        🔒 As mensagens (e imagens) são criptografadas no seu navegador. O backend nunca salva a chave da
+        conversa, apenas a mensagem já criptografada. Por segurança, a chave não é memorizada em lugar nenhum:
+        você precisa digitá-la toda vez que quiser ler o chat, e ela nunca é enviada ao backend. Você pode
+        conferir isso na aba Rede (Network) do developer tools do navegador: nenhuma requisição contém a chave.
+      </p>
       <div className="messages">
         {raw.map((m) => (
           <div key={m.id} className={`msg ${m.from === me ? 'mine' : 'theirs'}`}>
@@ -126,6 +149,11 @@ function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock 
         <div ref={bottom} />
       </div>
       {error && <p className="error">{error}</p>}
+      {zoom && (
+        <div className="lightbox" onClick={() => setZoom(null)}>
+          <img src={zoom} alt="imagem" />
+        </div>
+      )}
       <form className="composer" onSubmit={send}>
         <input
           placeholder={secret ? 'Mensagem' : 'Informe a chave da conversa para enviar'}
@@ -148,6 +176,7 @@ function Messenger({ me, onLogout }) {
   const [newFriend, setNewFriend] = useState('');
   const [info, setInfo] = useState({ text: '', error: false });
   const [incoming, setIncoming] = useState(null);
+  const [cleared, setCleared] = useState({}); // contador por amigo; muda quando a conversa é apagada
   // só em memória: a chave da conversa nunca é persistida
   const [secrets, setSecrets] = useState({});
   const [unread, setUnread] = useState({});
@@ -214,6 +243,7 @@ function Messenger({ me, onLogout }) {
           setIncoming(ev.message);
           if (ev.message.from !== me) notifyMessageRef.current(ev.message);
         }
+        if (ev.type === 'cleared') setCleared((c) => ({ ...c, [ev.with]: (c[ev.with] || 0) + 1 }));
         if (ev.type === 'friend' || ev.type === 'request') refresh().catch(() => {});
         if (ev.type === 'request' && permRef.current === 'granted' && !document.hasFocus()) {
           new Notification('Pedido de amizade', { body: `${ev.login} quer ser seu amigo`, tag: `req:${ev.login}` });
@@ -255,7 +285,7 @@ function Messenger({ me, onLogout }) {
   };
 
   return (
-    <div className="app">
+    <div className={`app ${active ? 'in-chat' : ''}`}>
       <aside>
         <div className="me">
           <span>{me}</span>
@@ -307,6 +337,8 @@ function Messenger({ me, onLogout }) {
           secret={secrets[active] || ''}
           onSecretChange={(v) => setSecret(active, v)}
           incoming={incoming}
+          cleared={cleared[active] || 0}
+          onBack={() => setActive(null)}
           onRemove={() => window.confirm(`Remover ${active} dos amigos?`) && act(() => api.removeFriend(active))}
           onBlock={() => window.confirm(`Bloquear ${active}?`) && act(() => api.block(active))}
         />
