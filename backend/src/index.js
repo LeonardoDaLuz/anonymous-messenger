@@ -17,7 +17,8 @@ const MIN_PASSWORD = 6; // só no cadastro; o login aceita contas antigas
 const MAX_FRIENDS = 500;
 const MAX_PENDING_REQUESTS = 100; // pedidos recebidos simultâneos por usuário
 const MAX_SOCKETS_PER_USER = 10;
-const MAX_CIPHERTEXT = 8 * 1024;
+const MAX_CIPHERTEXT = 1024 * 1024; // cabe uma imagem colada (base64 + AES-GCM)
+const MAX_CONVERSATION_BYTES = 16 * 1024 * 1024;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const COOKIE = 'sid';
 
@@ -178,7 +179,7 @@ function storeMessage(msg) {
   conv.messages.push(msg);
   conv.bytes += msg.data.length;
   totalBytes += msg.data.length;
-  while (conv.messages.length > MAX_MESSAGES) {
+  while (conv.messages.length > MAX_MESSAGES || (conv.bytes > MAX_CONVERSATION_BYTES && conv.messages.length > 1)) {
     const old = conv.messages.shift();
     conv.bytes -= old.data.length;
     totalBytes -= old.data.length;
@@ -262,7 +263,7 @@ app.use((req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || sameOrigin(req)) return next();
   res.status(403).json({ error: 'Origem inválida' });
 });
-app.use(express.json({ limit: '64kb' }));
+app.use(express.json({ limit: '1100kb' }));
 
 const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 

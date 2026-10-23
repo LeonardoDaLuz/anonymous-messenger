@@ -5,8 +5,36 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 const keyCache = new Map();
 
-const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const toB64 = (buf) => {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
 const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+// Imagens colam como data URL (base64) dentro do texto criptografado.
+export const IMAGE_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+const MAX_IMAGE_CHARS = 512 * 1024;
+const MAX_SIDE = 1280;
+
+// Reduz e recodifica (também remove metadados) até caber no limite.
+export async function imageToDataUrl(file) {
+  const bmp = await createImageBitmap(file);
+  let scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
+  for (let quality = 0.85; ; quality -= 0.15, scale *= 0.8) {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bmp.width * scale));
+    canvas.height = Math.max(1, Math.round(bmp.height * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    const url = canvas.toDataURL('image/jpeg', Math.max(quality, 0.4));
+    if (url.length <= MAX_IMAGE_CHARS) return url;
+    if (canvas.width < 64 && canvas.height < 64) throw new Error('Imagem grande demais');
+  }
+}
 
 export const cryptoAvailable = !!globalThis.crypto?.subtle;
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, setUnauthorizedHandler } from './api.js';
-import { cryptoAvailable, decryptText, encryptText } from './crypto.js';
+import { IMAGE_RE, cryptoAvailable, decryptText, encryptText, imageToDataUrl } from './crypto.js';
 
 function AuthScreen({ onAuth }) {
   const [mode, setMode] = useState('login');
@@ -82,10 +82,25 @@ function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock 
     }
   };
 
+  const paste = async (e) => {
+    const file = [...e.clipboardData.files].find((f) => f.type.startsWith('image/'));
+    if (!file) return;
+    e.preventDefault();
+    if (!secret) return;
+    setError('');
+    try {
+      await api.send(friend, await encryptText(await imageToDataUrl(file), secret, me, friend));
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+
   const show = (m) => {
     if (!secret) return <em className="locked">🔒 {m.data.slice(0, 40)}…</em>;
     if (plain[m.id] === undefined) return '…';
-    return plain[m.id] ?? <em className="locked">🔒 chave incorreta</em>;
+    const p = plain[m.id];
+    if (p == null) return <em className="locked">🔒 chave incorreta</em>;
+    return IMAGE_RE.test(p) ? <img src={p} alt="imagem" /> : p;
   };
 
   return (
@@ -117,6 +132,7 @@ function Chat({ me, friend, secret, onSecretChange, incoming, onRemove, onBlock 
           value={text}
           disabled={!secret}
           onChange={(e) => setText(e.target.value)}
+          onPaste={paste}
         />
         <button type="submit" disabled={!secret}>Enviar</button>
       </form>
@@ -159,7 +175,8 @@ function Messenger({ me, onLogout }) {
     setUnread((u) => ({ ...u, [m.from]: (u[m.from] || 0) + 1 }));
     if (permRef.current !== 'granted') return;
     const secret = secretsRef.current[m.from];
-    const body = (secret && (await decryptText(m.data, secret, me, m.from))) || 'Nova mensagem 🔒';
+    const plain = secret && (await decryptText(m.data, secret, me, m.from));
+    const body = !plain ? 'Nova mensagem 🔒' : IMAGE_RE.test(plain) ? '📷 Imagem' : plain;
     const n = new Notification(m.from, { body, tag: `msg:${m.from}` });
     n.onclick = () => { window.focus(); setActive(m.from); n.close(); };
   }, [me]);

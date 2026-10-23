@@ -37,3 +37,4 @@ button.danger { color: #ff7b7b; }
 .request span { flex: 1; word-break: break-all; }
 .blocked { font-size: 13px; opacity: .85; }
 .chat header strong { flex: 1; }
+.msg img { display: block; max-width: 100%; max-height: 360px; border-radius: 6px; }
