@@ -1,0 +1,39 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; background: #111418; color: #e6e8eb; }
+input, button { font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid #2c333b; background: #1b2026; color: inherit; }
+button { background: #2f6feb; border-color: #2f6feb; cursor: pointer; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.link { background: none; border: none; color: #8ab4ff; padding: 0; }
+.error { color: #ff7b7b; margin: 6px 0; }
+
+.auth { max-width: 320px; margin: 15vh auto; display: flex; flex-direction: column; gap: 10px; }
+.app { display: flex; height: 100vh; }
+aside { width: 260px; border-right: 1px solid #2c333b; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+aside form input { width: 100%; }
+aside .me { display: flex; justify-content: space-between; align-items: center; }
+aside ul { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+aside li { padding: 10px; border-radius: 6px; cursor: pointer; }
+aside li:hover, aside li.active { background: #1b2026; }
+
+.chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.chat.empty { align-items: center; justify-content: center; color: #7d8590; }
+.chat header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px; border-bottom: 1px solid #2c333b; }
+.messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.msg { max-width: 70%; padding: 8px 12px; border-radius: 10px; word-break: break-word; }
+.msg time { display: block; font-size: 11px; opacity: .6; margin-top: 2px; }
+.msg.mine { align-self: flex-end; background: #234a96; }
+.msg.theirs { align-self: flex-start; background: #1b2026; }
+.locked { opacity: .6; }
+.composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #2c333b; }
+.composer input { flex: 1; }
+aside li { display: flex; justify-content: space-between; align-items: center; }
+.badge { background: #e5484d; color: #fff; border-radius: 10px; padding: 0 7px; font-size: 12px; }
+.pad { padding: 24px; }
+button.secondary { background: #2c333b; border-color: #2c333b; }
+button.danger { color: #ff7b7b; }
+.ok { color: #6fcf97; margin: 6px 0; }
+.requests h3 { margin: 4px 0; font-size: 13px; opacity: .7; }
+.request { display: flex; align-items: center; gap: 6px; padding: 4px 0; }
+.request span { flex: 1; word-break: break-all; }
+.blocked { font-size: 13px; opacity: .85; }
+.chat header strong { flex: 1; }
