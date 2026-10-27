@@ -6,8 +6,20 @@ services:
     environment:
       - PORT=3000
       - DB_PATH=/data/app.db
+      - TRANSCRIBER_URL=http://transcriber:9000
+      - KLIPY_API_KEY=${KLIPY_API_KEY:-} # busca de GIFs (Klipy); vazio = sem GIFs. Fica no .env
     volumes:
       - db-data:/data
+    restart: unless-stopped
+
+  # Whisper (faster-whisper, CPU). Só o backend acessa: sem porta publicada.
+  transcriber:
+    build:
+      context: ./transcriber
+      args:
+        WHISPER_MODEL: small # tiny | base | small | medium
+    environment:
+      - WHISPER_LANGUAGE=pt # vazio = detectar o idioma sozinho (mais lento e erra em áudios curtos)
     restart: unless-stopped
 
   frontend:

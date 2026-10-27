@@ -19,8 +19,15 @@ As `location`s usadas em produção estão em `deploy/nginx/anonymous-messenger.
 - Conta = login + senha (mínimo 6 caracteres, sem e-mail). Usuários e amizades ficam no SQLite (volume `db-data`).
 - Adicionar amigo pelo login envia um pedido; a amizade só existe depois que a outra pessoa aceita (ou se os dois se adicionarem). Dá para remover amigos e bloquear (quem foi bloqueado não é avisado).
 - Mensagens ficam no SQLite do backend, apenas cifradas, sem limite de quantidade. Qualquer um dos dois lados pode apagar a conversa permanentemente pelo botão "Limpar chat".
-- A **chave da conversa** é digitada por cada um dos dois lados e fica só em memória no navegador (nunca é gravada; precisa ser digitada de novo após recarregar a página). Ela deriva (PBKDF2) uma chave AES-GCM; o servidor só vê texto cifrado.
+- A **chave da conversa** é digitada por cada um dos dois lados e é lembrada no `localStorage` do navegador, uma por amigo (por conta), e apagada ao clicar em Sair. Ela deriva (PBKDF2) uma chave AES-GCM; o servidor só vê texto cifrado.
 - Sem chave, ou com chave errada, a mensagem aparece como 🔒.
+
+## Mensagens de áudio e transcrição
+
+- O botão 🎤 grava até 60 s. O áudio vai dentro da mensagem cifrada, junto com a transcrição.
+- A transcrição usa o **faster-whisper** (Whisper em CPU, int8) no container `transcriber`, acessível só pelo backend. O áudio chega ao servidor **em claro**, apenas durante a transcrição; é processado em memória e descartado (nada é gravado em disco nem em log). Depois disso, áudio e texto existem só cifrados.
+- Se a transcrição falhar ou demorar, o áudio é enviado sem texto.
+- Modelo e idioma: `WHISPER_MODEL` (build arg: tiny, base, small, medium) e `WHISPER_LANGUAGE` (`pt` por padrão; vazio detecta sozinho) em `docker-compose.yml`. O modelo é baixado no build (~500 MB). Em CPU o `small` leva cerca de 1x a duração do áudio.
 
 ## Dev local
 

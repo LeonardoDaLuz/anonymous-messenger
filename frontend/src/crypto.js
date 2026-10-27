@@ -14,9 +14,60 @@ const toB64 = (buf) => {
 const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
 // Imagens colam como data URL (base64) dentro do texto criptografado.
-export const IMAGE_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+const IMAGE_RE = /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/;
+const VIDEO_RE = /^data:video\/mp4;base64,[A-Za-z0-9+/]+=*$/;
+// Link direto (https) para um .gif ou .mp4; só é carregado ao exibir a mensagem.
+const LINK_RE = /^https:\/\/[^\s"'<>]+\.(gif|mp4)(\?[^\s"'<>]*)?$/i;
+// Mensagem de áudio: JSON {k:'audio', src: data URL, t: transcrição, d: duração em segundos}.
+const AUDIO_RE = /^data:audio\/(webm|ogg|mp4|mpeg|wav|aac|x-m4a)(;codecs=[\w.,-]+)?;base64,[A-Za-z0-9+/]+=*$/;
 const MAX_IMAGE_CHARS = 512 * 1024;
+const MAX_MEDIA_CHARS = 4 * 1024 * 1024; // GIF e MP4 (~3 MB de arquivo)
+
+// Diz como renderizar o texto decifrado: { kind: 'image' | 'video', src } ou null.
+export function mediaOf(text) {
+  if (typeof text !== 'string') return null;
+  if (text.startsWith('{"k":"audio"')) {
+    try {
+      const o = JSON.parse(text);
+      if (o.k === 'audio' && typeof o.src === 'string' && AUDIO_RE.test(o.src)) {
+        return { kind: 'audio', src: o.src, transcript: typeof o.t === 'string' ? o.t.slice(0, 5000) : '', duration: Number(o.d) || 0 };
+      }
+    } catch {}
+    return null;
+  }
+  if (IMAGE_RE.test(text)) return { kind: 'image', src: text };
+  if (VIDEO_RE.test(text)) return { kind: 'video', src: text };
+  if (text.length <= 2048 && LINK_RE.test(text)) {
+    return { kind: /\.mp4(\?|$)/i.test(text) ? 'video' : 'image', src: text, remote: true };
+  }
+  return null;
+}
 const MAX_SIDE = 1280;
+
+// GIF e MP4 não passam pelo canvas (perderiam animação/vídeo): vão como vieram, se couberem no limite.
+export async function gifToDataUrl(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (String.fromCharCode(...bytes.subarray(0, 4)) !== 'GIF8') throw new Error('GIF inválido');
+  const url = `data:image/gif;base64,${toB64(bytes)}`;
+  if (url.length > MAX_MEDIA_CHARS) throw new Error('GIF grande demais (máx. ~3 MB)');
+  return url;
+}
+
+// Gravação do microfone -> texto da mensagem (a ser cifrado). `transcript` pode ser vazio.
+export async function audioMessage(blob, transcript, duration) {
+  const src = `data:${blob.type.replace(/\s/g, '')};base64,${toB64(await blob.arrayBuffer())}`;
+  if (!AUDIO_RE.test(src)) throw new Error('Formato de áudio não suportado');
+  if (src.length > MAX_MEDIA_CHARS) throw new Error('Áudio grande demais');
+  return JSON.stringify({ k: 'audio', src, t: transcript, d: Math.round(duration) });
+}
+
+export async function mp4ToDataUrl(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (String.fromCharCode(...bytes.subarray(4, 8)) !== 'ftyp') throw new Error('MP4 inválido');
+  const url = `data:video/mp4;base64,${toB64(bytes)}`;
+  if (url.length > MAX_MEDIA_CHARS) throw new Error('Vídeo grande demais (máx. ~3 MB)');
+  return url;
+}
 
 // Reduz e recodifica (também remove metadados) até caber no limite.
 export async function imageToDataUrl(file) {
