@@ -5,25 +5,39 @@ let pushActive = false; // com Web Push ativo, quem avisa é o service worker (v
 
 const toBytes = (b64) => Uint8Array.from(atob(b64.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(b64.length / 4) * 4, '=')), (c) => c.charCodeAt(0));
 
-// Inscreve este aparelho no push (pede a permissão se ainda não foi dada). Devolve a permissão.
+// Pede a permissão de notificação se ainda não foi dada (a inscrição é feita por syncPush). Devolve a permissão.
 export async function enablePush() {
   if (!('Notification' in window)) return 'denied';
-  const perm = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission;
-  if (perm === 'granted') await syncPush();
-  return perm;
+  return Notification.permission === 'default' ? Notification.requestPermission() : Notification.permission;
 }
 
 // Garante que a inscrição do navegador existe e pertence ao usuário logado.
+// Devolve '' se o push está ativo, ou o motivo de não estar (o aviso com o app fechado depende dele).
 export async function syncPush() {
-  if (!supported || Notification.permission !== 'granted') return;
+  pushActive = false;
+  if (!('Notification' in window)) return 'Este navegador não suporta notificações.';
+  if (!supported) {
+    return /iPhone|iPad/.test(navigator.userAgent)
+      ? 'No iPhone/iPad, instale o app na Tela de Início para receber avisos com ele fechado.'
+      : 'Este navegador não suporta avisos com o app fechado.';
+  }
+  if (Notification.permission !== 'granted') return '';
   try {
+    const key = toBytes((await api.pushKey()).key);
     const reg = await navigator.serviceWorker.ready;
-    const sub = (await reg.pushManager.getSubscription())
-      || (await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: toBytes((await api.pushKey()).key) }));
+    let sub = await reg.pushManager.getSubscription();
+    // inscrição criada com outra chave VAPID (ex.: servidor recriado) não recebe nada: refaz
+    const old = sub?.options?.applicationServerKey;
+    if (sub && old && (old.byteLength !== key.length || new Uint8Array(old).some((v, i) => v !== key[i]))) {
+      await sub.unsubscribe();
+      sub = null;
+    }
+    sub ||= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
     await api.pushSubscribe(sub.toJSON());
     pushActive = true;
-  } catch {
-    pushActive = false;
+    return '';
+  } catch (err) {
+    return `Não foi possível ativar avisos com o app fechado (${err?.message || err?.name || 'erro'}).`;
   }
 }
 

@@ -22,6 +22,25 @@ As `location`s usadas em produção estão em `deploy/nginx/anonymous-messenger.
 - A **chave da conversa** é digitada por cada um dos dois lados e é lembrada no `localStorage` do navegador, uma por amigo (por conta), e apagada ao clicar em Sair. Ela deriva (PBKDF2) uma chave AES-GCM; o servidor só vê texto cifrado.
 - Sem chave, ou com chave errada, a mensagem aparece como 🔒.
 
+## Estilo visual
+
+**Siga o estilo visual do Discord** em tudo que for interface: tema escuro, barra de servidores à esquerda com quadrados arredondados, lista de canais e membros na lateral, mensagens em linhas (sem balões) com avatar redondo à esquerda e, em cima, o nome de quem enviou e a hora, barra de ações ao passar o mouse sobre a mensagem, respostas com citação acima da mensagem. Ícones são sempre SVG (nunca caracteres Unicode, que quebram em algumas fontes).
+
+## Mensagens
+
+- **Cabeçalho:** cada mensagem mostra o avatar e o nome de quem enviou; mensagens seguidas do mesmo autor (até 5 min) ficam agrupadas.
+- **Avatar:** clique no seu avatar no topo da lateral para trocar (a imagem é recortada em quadrado e reduzida a 128×128 JPEG no navegador) ou no ✕ ao lado para remover. Quem não tem foto aparece com a inicial. Avatares ficam no banco **sem criptografia** (são a foto de perfil) e só são visíveis para você, seus amigos e quem divide um servidor com você.
+- **Responder:** clique numa mensagem para selecioná-la e use o botão de responder. A citação (autor e trecho) vai dentro da mensagem cifrada; clicar nela rola até a mensagem original.
+- **Editar:** só o autor e só mensagens de texto; aparece "(editado)". **Apagar:** o autor apaga a própria mensagem (para todos, sem volta); o dono do servidor apaga qualquer mensagem do servidor.
+
+## Servidores
+
+- A barra à esquerda lista os servidores (quadrado arredondado com ícone e cor, escolhidos na criação); o botão 💬 volta às mensagens diretas e o ＋ cria um servidor.
+- Quem cria é o dono: adiciona **amigos** como membros, remove membros, cria/apaga canais, limpa canais e apaga o servidor. Os outros membros podem sair.
+- Cada servidor tem canais (`#geral` por padrão) e usa a mesma criptografia das conversas diretas, com uma **chave por servidor** digitada por cada membro e lembrada só no navegador. O servidor guarda apenas texto cifrado.
+- Reações, GIFs, imagens, áudio com transcrição, notificações e presença online funcionam como nas conversas diretas (a presença vale também para quem divide um servidor com você). Não há "visto" em servidores.
+- Limites: 10 servidores criados e 50 participações por pessoa, 100 membros e 20 canais por servidor.
+
 ## Mensagens de áudio e transcrição
 
 - O botão 🎤 grava até 60 s. O áudio vai dentro da mensagem cifrada, junto com a transcrição.

@@ -2,21 +2,41 @@ import express from 'express';
 import helmet from 'helmet';
 import { createServer } from 'node:http';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { WebSocketServer } from 'ws';
 import webpush from 'web-push';
+import { sendMail } from './mail.js';
 
 const scrypt = promisify(crypto.scrypt);
 
 const PORT = Number(process.env.PORT) || 3000;
 const DB_PATH = process.env.DB_PATH || './app.db';
 const MAX_USERS = Number(process.env.MAX_USERS) || 10000;
-const MIN_PASSWORD = 6; // só no cadastro; o login aceita contas antigas
+const MIN_PASSWORD = 6;
+const PUBLIC_URL = (process.env.PUBLIC_URL || 'http://localhost:5173').replace(/\/$/, ''); // base dos links enviados por e-mail
+const CONFIRM_TTL_MS = 24 * 60 * 60 * 1000;
+const RESET_TTL_MS = 60 * 60 * 1000;
 const MAX_FRIENDS = 500;
 const MAX_PENDING_REQUESTS = 100; // pedidos recebidos simultâneos por usuário
 const MAX_SOCKETS_PER_USER = 10;
-const MAX_CIPHERTEXT = 6 * 1024 * 1024; // cabe um MP4/GIF de ~3 MB (base64 + AES-GCM + base64)
+const MAX_CIPHERTEXT = 16 * 1024 * 1024; // texto, imagem pequena ou áudio (base64 + AES-GCM + base64); vídeos/GIFs grandes vão como arquivo
+// Arquivos (vídeo/GIF): cifrados no navegador em blocos de 1 MiB (iv 12 B + tag 16 B por bloco) e guardados em disco.
+const FILES_DIR = process.env.FILES_DIR || path.join(path.dirname(DB_PATH), 'files');
+const FILE_CHUNK = 1024 * 1024;
+const GCM_OVERHEAD = 28;
+const MAX_FILE_PLAIN = 2 * 1024 * 1024 * 1024;
+const MAX_FILE_STORED = MAX_FILE_PLAIN + Math.ceil(MAX_FILE_PLAIN / FILE_CHUNK) * GCM_OVERHEAD;
+const MAX_PART_BYTES = 16 * 1024 * 1024; // cada requisição de upload leva uma parte
+const MAX_USER_FILE_BYTES = (Number(process.env.FILES_MAX_PER_USER_GB) || 10) * 1024 ** 3;
+const MAX_PENDING_FILES = 5; // enviados e ainda não anexados a uma mensagem
+const PENDING_FILE_TTL_MS = 60 * 60 * 1000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+fs.mkdirSync(FILES_DIR, { recursive: true });
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const COOKIE = 'sid';
 const TRANSCRIBER_URL = process.env.TRANSCRIBER_URL || ''; // serviço Whisper interno; vazio = sem transcrição
@@ -95,6 +115,19 @@ db.exec(`
     auth TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS push_subs_user ON push_subs (user_id);
+  CREATE TABLE IF NOT EXISTS servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    icon TEXT NOT NULL,
+    color TEXT NOT NULL,
+    owner_id INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS server_members (
+    server_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (server_id, user_id)
+  );
+  CREATE INDEX IF NOT EXISTS server_members_user ON server_members (user_id);
 `);
 
 // Chaves VAPID do Web Push: geradas na primeira execução e guardadas no banco.
@@ -111,6 +144,40 @@ webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
 if (!db.prepare('PRAGMA table_info(messages)').all().some((c) => c.name === 'channel')) {
   db.exec(`ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'main'`);
 }
+if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'avatar')) {
+  db.exec('ALTER TABLE users ADD COLUMN avatar BLOB');
+  db.exec('ALTER TABLE users ADD COLUMN avatar_v INTEGER'); // versão (data do envio) para o navegador renovar o cache
+}
+if (!db.prepare('PRAGMA table_info(messages)').all().some((c) => c.name === 'edited_at')) {
+  db.exec('ALTER TABLE messages ADD COLUMN edited_at INTEGER'); // quando o autor editou o texto (null = nunca)
+}
+if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'email')) {
+  db.exec('ALTER TABLE users ADD COLUMN email TEXT');
+  db.exec('ALTER TABLE users ADD COLUMN email_verified_at INTEGER'); // null = ainda não confirmou
+}
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users (email)');
+db.exec(`CREATE TABLE IF NOT EXISTS email_tokens (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS files (
+  id TEXT PRIMARY KEY,
+  conv TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  size INTEGER NOT NULL DEFAULT 0,
+  complete INTEGER NOT NULL DEFAULT 0,
+  message_id TEXT,
+  updated_at INTEGER NOT NULL
+)`);
+db.exec(`CREATE TABLE IF NOT EXISTS reset_tokens (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+)`);
+db.exec('CREATE INDEX IF NOT EXISTS files_conv ON files (conv, channel)');
+db.exec('CREATE INDEX IF NOT EXISTS files_message ON files (message_id)');
 db.exec('CREATE INDEX IF NOT EXISTS messages_conv_channel_ts ON messages (conv, channel, ts)');
 
 const q = {
@@ -126,8 +193,22 @@ const q = {
   ),
   deletePushSub: db.prepare('DELETE FROM push_subs WHERE endpoint = ? AND user_id = ?'),
   deletePushSubAny: db.prepare('DELETE FROM push_subs WHERE endpoint = ?'),
-  insertUser: db.prepare('INSERT INTO users (login, password_hash) VALUES (?, ?)'),
+  insertUser: db.prepare('INSERT INTO users (login, email, password_hash) VALUES (?, ?, ?)'),
   userByLogin: db.prepare('SELECT * FROM users WHERE login = ?'),
+  userByEmail: db.prepare('SELECT * FROM users WHERE email = ?'),
+  insertEmailToken: db.prepare('INSERT INTO email_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
+  emailToken: db.prepare('SELECT user_id FROM email_tokens WHERE token_hash = ? AND expires_at > ?'),
+  deleteEmailTokensOf: db.prepare('DELETE FROM email_tokens WHERE user_id = ?'),
+  verifyEmail: db.prepare('UPDATE users SET email_verified_at = ? WHERE id = ?'),
+  insertResetToken: db.prepare('INSERT INTO reset_tokens (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
+  resetToken: db.prepare('SELECT user_id FROM reset_tokens WHERE token_hash = ? AND expires_at > ?'),
+  deleteResetTokensOf: db.prepare('DELETE FROM reset_tokens WHERE user_id = ?'),
+  purgeResetTokens: db.prepare('DELETE FROM reset_tokens WHERE expires_at <= ?'),
+  setPassword: db.prepare('UPDATE users SET password_hash = ?, email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?'),
+  deleteSessionsOfUser: db.prepare('DELETE FROM sessions WHERE user_id = ?'),
+  purgeEmailTokens: db.prepare('DELETE FROM email_tokens WHERE expires_at <= ?'),
+  // cadastros que nunca confirmaram o e-mail liberam o login/e-mail
+  purgeUnverified: db.prepare('DELETE FROM users WHERE email_verified_at IS NULL AND email IS NOT NULL AND created_at < ?'),
 
   insertSession: db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)'),
   deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash = ?'),
@@ -162,13 +243,16 @@ const q = {
 
   messageOwner: db.prepare('SELECT channel, from_id, ts FROM messages WHERE id = ? AND conv = ?'),
   updateMessageData: db.prepare('UPDATE messages SET data = ? WHERE id = ?'),
+  updateMessageEdited: db.prepare('UPDATE messages SET data = ?, edited_at = ? WHERE id = ?'),
+  deleteMessage: db.prepare('DELETE FROM messages WHERE id = ?'),
+  deleteReactionsOfMessage: db.prepare('DELETE FROM reactions WHERE message_id = ?'),
   insertMessage: db.prepare(
     'INSERT INTO messages (id, conv, channel, from_id, to_id, data, ts) VALUES (?, ?, ?, ?, ?, ?, ?)'
   ),
   // `seq` (rowid) é a posição da mensagem na conversa: serve de cursor da paginação e de marca de leitura.
   messagesPage: db.prepare(
-    `SELECT m.rowid AS seq, m.id, m.channel, a.login AS "from", b.login AS "to", m.data, m.ts
-     FROM messages m JOIN users a ON a.id = m.from_id JOIN users b ON b.id = m.to_id
+    `SELECT m.rowid AS seq, m.id, m.channel, a.login AS "from", b.login AS "to", m.data, m.ts, m.edited_at AS edited
+     FROM messages m JOIN users a ON a.id = m.from_id LEFT JOIN users b ON b.id = m.to_id
      WHERE m.conv = ? AND m.channel = ? AND m.rowid < ? ORDER BY m.rowid DESC LIMIT ?`
   ),
   maxSeq: db.prepare('SELECT MAX(rowid) AS n FROM messages WHERE conv = ? AND channel = ?'),
@@ -179,6 +263,7 @@ const q = {
   ),
   deleteReadsConv: db.prepare('DELETE FROM reads WHERE conv = ?'),
   deleteReadsChannel: db.prepare('DELETE FROM reads WHERE conv = ? AND channel = ?'),
+  deleteReadsOfUser: db.prepare('DELETE FROM reads WHERE conv = ? AND user_id = ?'),
   deleteMessages: db.prepare('DELETE FROM messages WHERE conv = ?'),
   deleteChannelMessages: db.prepare('DELETE FROM messages WHERE conv = ? AND channel = ?'),
   messageChannel: db.prepare('SELECT channel FROM messages WHERE id = ? AND conv = ?'),
@@ -210,6 +295,57 @@ const q = {
   insertChannel: db.prepare('INSERT INTO channels (id, conv, name, created_by) VALUES (?, ?, ?, ?)'),
   deleteChannel: db.prepare('DELETE FROM channels WHERE id = ? AND conv = ?'),
   deleteChannels: db.prepare('DELETE FROM channels WHERE conv = ?'),
+
+  fileById: db.prepare('SELECT * FROM files WHERE id = ?'),
+  insertFile: db.prepare('INSERT INTO files (id, conv, channel, user_id, updated_at) VALUES (?, ?, ?, ?, ?)'),
+  setFileProgress: db.prepare('UPDATE files SET size = ?, complete = ?, updated_at = ? WHERE id = ?'),
+  deleteFile: db.prepare('DELETE FROM files WHERE id = ?'),
+  linkFile: db.prepare('UPDATE files SET message_id = ? WHERE id = ?'),
+  pendingFilesOf: db.prepare('SELECT COUNT(*) AS n FROM files WHERE user_id = ? AND message_id IS NULL'),
+  fileBytesOf: db.prepare('SELECT COALESCE(SUM(size), 0) AS n FROM files WHERE user_id = ?'),
+  staleFiles: db.prepare('SELECT id FROM files WHERE message_id IS NULL AND updated_at < ?'),
+  fileIdsOfMessage: db.prepare('SELECT id FROM files WHERE message_id = ?'),
+  deleteFilesOfMessage: db.prepare('DELETE FROM files WHERE message_id = ?'),
+  fileIdsOfConv: db.prepare('SELECT id FROM files WHERE conv = ?'),
+  deleteFilesOfConv: db.prepare('DELETE FROM files WHERE conv = ?'),
+  fileIdsOfChannel: db.prepare('SELECT id FROM files WHERE conv = ? AND channel = ?'),
+  deleteFilesOfChannel: db.prepare('DELETE FROM files WHERE conv = ? AND channel = ?'),
+  userById: db.prepare('SELECT id, login FROM users WHERE id = ?'),
+  setAvatar: db.prepare('UPDATE users SET avatar = ?, avatar_v = ? WHERE id = ?'),
+  avatarOf: db.prepare('SELECT avatar, avatar_v FROM users WHERE login = ? AND avatar IS NOT NULL'),
+  // login -> versão do avatar de quem o usuário enxerga: ele mesmo, os amigos e quem divide um servidor
+  avatarVersions: db.prepare(
+    `SELECT login, avatar_v AS v FROM users WHERE avatar IS NOT NULL AND (
+       id = ?1
+       OR id IN (SELECT friend_id FROM friendships WHERE user_id = ?1)
+       OR id IN (SELECT b.user_id FROM server_members a JOIN server_members b ON b.server_id = a.server_id WHERE a.user_id = ?1)
+     )`
+  ),
+  insertServer: db.prepare('INSERT INTO servers (id, name, icon, color, owner_id) VALUES (?, ?, ?, ?, ?)'),
+  serverById: db.prepare('SELECT * FROM servers WHERE id = ?'),
+  deleteServer: db.prepare('DELETE FROM servers WHERE id = ?'),
+  deleteServerMembers: db.prepare('DELETE FROM server_members WHERE server_id = ?'),
+  serversOf: db.prepare(
+    `SELECT s.id, s.name, s.icon, s.color, o.login AS owner
+     FROM server_members m JOIN servers s ON s.id = m.server_id JOIN users o ON o.id = s.owner_id
+     WHERE m.user_id = ? ORDER BY m.rowid`
+  ),
+  countServersOf: db.prepare('SELECT COUNT(*) AS n FROM server_members WHERE user_id = ?'),
+  countOwnedServers: db.prepare('SELECT COUNT(*) AS n FROM servers WHERE owner_id = ?'),
+  isMember: db.prepare('SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?'),
+  addMember: db.prepare('INSERT OR IGNORE INTO server_members (server_id, user_id) VALUES (?, ?)'),
+  removeMember: db.prepare('DELETE FROM server_members WHERE server_id = ? AND user_id = ?'),
+  countMembers: db.prepare('SELECT COUNT(*) AS n FROM server_members WHERE server_id = ?'),
+  membersOf: db.prepare(
+    `SELECT u.id, u.login FROM server_members m JOIN users u ON u.id = m.user_id
+     WHERE m.server_id = ? ORDER BY u.login`
+  ),
+  // quem divide algum servidor com o usuário (para a presença online)
+  coMembersOf: db.prepare(
+    `SELECT DISTINCT u.login FROM server_members a
+     JOIN server_members b ON b.server_id = a.server_id AND b.user_id != a.user_id
+     JOIN users u ON u.id = b.user_id WHERE a.user_id = ?`
+  ),
 
   insertBlock: db.prepare('INSERT OR IGNORE INTO blocks (user_id, blocked_id) VALUES (?, ?)'),
   deleteBlock: db.prepare('DELETE FROM blocks WHERE user_id = ? AND blocked_id = ?'),
@@ -279,17 +415,46 @@ function startSession(req, res, user) {
   });
 }
 
-setInterval(() => q.purgeSessions.run(Date.now()), 60 * 60 * 1000).unref();
+setInterval(() => {
+  q.purgeSessions.run(Date.now());
+  q.purgeEmailTokens.run(Date.now());
+  q.purgeResetTokens.run(Date.now());
+  q.purgeUnverified.run(new Date(Date.now() - CONFIRM_TTL_MS).toISOString().slice(0, 19).replace('T', ' '));
+}, 60 * 60 * 1000).unref();
 
 // ---------- mensagens (SQLite; só texto cifrado) ----------
 const convKey = (idA, idB) => (idA < idB ? `${idA}:${idB}` : `${idB}:${idA}`);
+const serverConv = (serverId) => `s:${serverId}`;
 
 // Cada conversa tem o canal padrão ("main", exibido como #geral) mais os criados pelos dois lados.
 const MAIN_CHANNEL = { id: 'main', name: 'geral' };
 const MAX_CHANNELS = 20;
 const MAX_CHANNEL_NAME = 32;
+// Apaga do disco os arquivos cujas linhas acabaram de sair do banco. Roda depois do COMMIT
+// (as transações são síncronas); o varredor abaixo recolhe qualquer sobra.
+function dropFiles(selectIds, deleteRows, ...args) {
+  const ids = selectIds.all(...args).map((r) => r.id);
+  deleteRows.run(...args);
+  setImmediate(() => { for (const id of ids) fs.unlink(path.join(FILES_DIR, id), () => {}); });
+}
+
+function sweepFiles() {
+  const stale = q.staleFiles.all(Date.now() - PENDING_FILE_TTL_MS).map((r) => r.id);
+  for (const id of stale) {
+    q.deleteFile.run(id);
+    fs.unlink(path.join(FILES_DIR, id), () => {});
+  }
+  fs.readdir(FILES_DIR, (err, names) => {
+    if (err) return;
+    for (const name of names) if (!q.fileById.get(name)) fs.unlink(path.join(FILES_DIR, name), () => {});
+  });
+}
+sweepFiles();
+setInterval(sweepFiles, 60 * 60 * 1000).unref();
+
 const wipeConversation = (conv) => {
   tx(() => {
+    dropFiles(q.fileIdsOfConv, q.deleteFilesOfConv, conv);
     q.deleteReactionsConv.run(conv);
     q.deleteMessages.run(conv);
     q.deleteChannels.run(conv);
@@ -297,6 +462,7 @@ const wipeConversation = (conv) => {
   });
 };
 const wipeChannelMessages = (conv, channel) => {
+  dropFiles(q.fileIdsOfChannel, q.deleteFilesOfChannel, conv, channel);
   q.deleteReactionsChannel.run(conv, channel);
   q.deleteChannelMessages.run(conv, channel);
   q.deleteReadsChannel.run(conv, channel);
@@ -342,8 +508,10 @@ function pushNotify(userId, payload, { ttl = 86400, urgency = 'normal' } = {}) {
 // Presença: os amigos veem quem está online. O "offline" espera alguns segundos para um refresh
 // da página não piscar.
 const offlineTimers = new Map();
+// Quem vê a presença de alguém: os amigos e os membros dos servidores em comum.
+const watchersOf = (userId) => new Set([...q.friendsOf.all(userId), ...q.coMembersOf.all(userId)].map((r) => r.login));
 function announcePresence(user, online) {
-  for (const f of q.friendsOf.all(user.id)) push(f.login, { type: 'presence', login: user.login, online });
+  for (const login of watchersOf(user.id)) push(login, { type: 'presence', login: user.login, online });
 }
 
 function closeSockets(login, sid) {
@@ -386,7 +554,9 @@ const limitLoginUser = rateLimit({
 });
 const limitFriendRequests = rateLimit({ windowMs: 60 * MIN, max: 30, key: (req) => req.user.id });
 const limitChannels = rateLimit({ windowMs: 60 * MIN, max: 60, key: (req) => req.user.id });
-const limitTranscribe = rateLimit({ windowMs: 10 * MIN, max: 30, key: (req) => req.user.id });
+const limitServers = rateLimit({ windowMs: 60 * MIN, max: 20, key: (req) => req.user.id });
+const limitMembers = rateLimit({ windowMs: 60 * MIN, max: 60, key: (req) => req.user.id });
+const limitTranscribe =rateLimit({ windowMs: 10 * MIN, max: 30, key: (req) => req.user.id });
 const limitRead = rateLimit({ windowMs: MIN, max: 300, key: (req) => req.user.id });
 const limitSend = rateLimit({ windowMs: MIN, max: 120, key: (req) => req.user.id });
 const limitCall = rateLimit({ windowMs: MIN, max: 600, key: (req) => req.user.id }); // inclui candidatos ICE
@@ -414,44 +584,140 @@ app.use((req, res, next) => {
   if (req.method === 'GET' || req.method === 'HEAD' || sameOrigin(req)) return next();
   res.status(403).json({ error: 'Origem inválida' });
 });
-app.use(express.json({ limit: '6200kb' }));
+app.use(express.json({ limit: '24mb' }));
 
 const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // Sem caracteres de controle no login (evita logins invisíveis ou ambíguos).
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 
-function credentials(body) {
-  const { login, password } = body ?? {};
-  if (typeof login !== 'string' || typeof password !== 'string') return null;
-  if (login.trim() === '' || login.length > 100 || CONTROL_CHARS.test(login)) return null;
-  return { login, password };
+const EMAIL_RE = /^[^\s@<>"',;:()\[\]\\]{1,64}@[^\s@<>"',;:()\[\]\\]{1,253}\.[a-z]{2,}$/i;
+const normEmail = (e) => (typeof e === 'string' && e.length <= 254 && EMAIL_RE.test(e.trim()) ? e.trim().toLowerCase() : null);
+
+async function sendConfirmation(user) {
+  q.deleteEmailTokensOf.run(user.id);
+  const token = crypto.randomBytes(32).toString('base64url');
+  q.insertEmailToken.run(hashToken(token), user.id, Date.now() + CONFIRM_TTL_MS);
+  const link = `${PUBLIC_URL}/confirmar-email?token=${token}`;
+  const name = user.login.replace(/[<>&"]/g, '');
+  // Em segundo plano; falhas só vão para o log.
+  sendMail({
+    to: user.email,
+    subject: 'Confirme seu e-mail - Anonymous Messenger',
+    text: `Olá, ${user.login}!\n\nConfirme seu e-mail para ativar a conta:\n${link}\n\nO link vale por 24 horas. Se não foi você, ignore esta mensagem.`,
+    html: `<p>Olá, <b>${name}</b>!</p><p><a href="${link}">Confirmar meu e-mail</a></p><p>Ou abra: ${link}</p><p>O link vale por 24 horas. Se não foi você, ignore esta mensagem.</p>`,
+  }).then(
+    (info) => console.log(`[mail] confirmação enviada para ${user.email}: ${info.response}`),
+    (err) => console.error(`[mail] falha ao enviar para ${user.email}: ${err.message}`)
+  );
 }
 
 app.post('/api/register', limitRegister, ah(async (req, res) => {
-  const c = credentials(req.body);
-  if (!c) return res.status(400).json({ error: 'Login inválido' });
-  if (c.password.length < MIN_PASSWORD) {
+  const { login, email: rawEmail, password } = req.body ?? {};
+  if (typeof login !== 'string' || login.trim() === '' || login.length > 100 || CONTROL_CHARS.test(login) || login.includes('@')) {
+    return res.status(400).json({ error: 'Nome de usuário inválido (não pode conter @)' });
+  }
+  const email = normEmail(rawEmail);
+  if (!email) return res.status(400).json({ error: 'E-mail inválido' });
+  if (typeof password !== 'string' || password.length < MIN_PASSWORD) {
     return res.status(400).json({ error: `A senha deve ter no mínimo ${MIN_PASSWORD} caracteres` });
   }
   if (q.countUsers.get().n >= MAX_USERS) return res.status(503).json({ error: 'Cadastros fechados no momento' });
-  if (q.userByLogin.get(c.login)) return res.status(409).json({ error: 'Login já existe' });
-  const passwordHash = await hashPassword(c.password);
+  if (q.userByLogin.get(login)) return res.status(409).json({ error: 'Nome de usuário já existe' });
+  if (q.userByEmail.get(email)) return res.status(409).json({ error: 'E-mail já cadastrado' });
+  const passwordHash = await hashPassword(password);
   let id;
   try {
-    id = Number(q.insertUser.run(c.login, passwordHash).lastInsertRowid);
+    id = Number(q.insertUser.run(login, email, passwordHash).lastInsertRowid);
   } catch {
-    return res.status(409).json({ error: 'Login já existe' }); // corrida entre dois cadastros
+    return res.status(409).json({ error: 'Nome de usuário ou e-mail já existe' }); // corrida entre dois cadastros
   }
-  startSession(req, res, { id });
-  res.json({ login: c.login });
+  sendConfirmation({ id, login, email });
+  res.json({ pending: true });
 }));
 
+// Reenvio do link: resposta sempre igual, para não revelar quais e-mails existem.
+const limitResend = rateLimit({ windowMs: 60 * MIN, max: 5, key: (req) => `${req.ip}\u0000${String(req.body?.email).slice(0, 254)}` });
+app.post('/api/resend-confirmation', limitResend, (req, res) => {
+  const email = normEmail(req.body?.email);
+  const user = email && q.userByEmail.get(email);
+  if (user && !user.email_verified_at) sendConfirmation(user);
+  res.json({});
+});
+
+// O link do e-mail leva ao frontend, que chama esta rota (POST, para que leitores de link
+// do provedor de e-mail não gastem o token). Confirmar já inicia a sessão.
+const limitConfirm = rateLimit({ windowMs: 10 * MIN, max: 30, key: (req) => req.ip });
+app.post('/api/confirm-email', limitConfirm, (req, res) => {
+  const token = req.body?.token;
+  const row = typeof token === 'string' && token.length <= 100 && q.emailToken.get(hashToken(token), Date.now());
+  const user = row && q.userById.get(row.user_id);
+  if (!user) return res.status(400).json({ error: 'Link inválido ou expirado' });
+  q.verifyEmail.run(Date.now(), user.id);
+  q.deleteEmailTokensOf.run(user.id);
+  startSession(req, res, user);
+  res.json({ login: user.login });
+});
+
+// Recuperar senha: o link vai para o e-mail cadastrado. A resposta é sempre a mesma, para não revelar
+// quais e-mails existem. As conversas não dependem da senha (a chave de cada conversa é digitada à parte),
+// então redefinir a senha não faz perder mensagens.
+const limitForgot = rateLimit({ windowMs: 60 * MIN, max: 5, key: (req) => `${req.ip}\u0000${String(req.body?.email).slice(0, 254)}` });
+const limitForgotIp = rateLimit({ windowMs: 60 * MIN, max: 20, key: (req) => req.ip });
+app.post('/api/forgot-password', limitForgotIp, limitForgot, (req, res) => {
+  const email = normEmail(req.body?.email);
+  const user = email && q.userByEmail.get(email);
+  if (user) {
+    q.deleteResetTokensOf.run(user.id);
+    const token = crypto.randomBytes(32).toString('base64url');
+    q.insertResetToken.run(hashToken(token), user.id, Date.now() + RESET_TTL_MS);
+    const link = `${PUBLIC_URL}/redefinir-senha?token=${token}`;
+    const name = user.login.replace(/[<>&"]/g, '');
+    sendMail({
+      to: user.email,
+      subject: 'Redefinir sua senha - Anonymous Messenger',
+      text: `Olá, ${user.login}!\n\nPara criar uma nova senha, abra:\n${link}\n\nO link vale por 1 hora. Se não foi você, ignore esta mensagem: sua senha continua a mesma.`,
+      html: `<p>Olá, <b>${name}</b>!</p><p><a href="${link}">Criar nova senha</a></p><p>Ou abra: ${link}</p><p>O link vale por 1 hora. Se não foi você, ignore esta mensagem: sua senha continua a mesma.</p>`,
+    }).then(
+      (info) => console.log(`[mail] recuperação enviada para ${user.email}: ${info.response}`),
+      (err) => console.error(`[mail] falha ao enviar para ${user.email}: ${err.message}`)
+    );
+  }
+  res.json({});
+});
+
+const limitReset = rateLimit({ windowMs: 10 * MIN, max: 20, key: (req) => req.ip });
+app.post('/api/reset-password', limitReset, ah(async (req, res) => {
+  const { token, password } = req.body ?? {};
+  const row = typeof token === 'string' && token.length <= 100 && q.resetToken.get(hashToken(token), Date.now());
+  const user = row && q.userById.get(row.user_id);
+  if (!user) return res.status(400).json({ error: 'Link inválido ou expirado' });
+  if (typeof password !== 'string' || password.length < MIN_PASSWORD || password.length > 1000) {
+    return res.status(400).json({ error: `A senha deve ter no mínimo ${MIN_PASSWORD} caracteres` });
+  }
+  const passwordHash = await hashPassword(password);
+  const oldSockets = [...(sockets.get(user.login) ?? [])];
+  tx(() => {
+    q.setPassword.run(passwordHash, Date.now(), user.id); // abrir o link prova o acesso ao e-mail
+    q.deleteResetTokensOf.run(user.id);
+    q.deleteEmailTokensOf.run(user.id);
+    q.deleteSessionsOfUser.run(user.id); // desloga todos os aparelhos
+  });
+  for (const ws of oldSockets) ws.close(4401, 'logout');
+  startSession(req, res, user);
+  res.json({ login: user.login });
+}));
+
+// "login" aceita o e-mail ou o nome de usuário.
 app.post('/api/login', limitLoginIp, limitLoginUser, ah(async (req, res) => {
-  const c = credentials(req.body);
-  const user = c && q.userByLogin.get(c.login);
-  const ok = await verifyPassword(c?.password ?? '', user ? user.password_hash : DUMMY_HASH);
-  if (!user || !ok) return res.status(401).json({ error: 'Login ou senha incorretos' });
+  const { login, password } = req.body ?? {};
+  const ok0 = typeof login === 'string' && typeof password === 'string' && login.length <= 254;
+  const user = ok0 && (login.includes('@') ? q.userByEmail.get(login.trim().toLowerCase()) : q.userByLogin.get(login));
+  const ok = await verifyPassword(ok0 ? password : '', user ? user.password_hash : DUMMY_HASH);
+  if (!user || !ok) return res.status(401).json({ error: 'Usuário/e-mail ou senha incorretos' });
+  if (!user.email_verified_at) {
+    return res.status(403).json({ error: 'Confirme seu e-mail antes de entrar (veja a caixa de entrada e o spam)', unverified: true, email: user.email });
+  }
   startSession(req, res, user);
   res.json({ login: user.login });
 }));
@@ -476,7 +742,43 @@ app.post('/api/logout', (req, res) => {
 
 app.get('/api/me', auth, (req, res) => res.json({ login: req.user.login }));
 
-app.get('/api/presence', auth, (req, res) => res.json(q.friendsOf.all(req.user.id).map((r) => r.login).filter((l) => sockets.has(l))));
+// Avatar: o navegador recorta e reduz para um JPEG pequeno; aqui só se confere que é mesmo um JPEG.
+// Fica no banco sem criptografia, pois é a foto de perfil que os outros veem.
+const MAX_AVATAR_BYTES = 100 * 1024;
+const limitAvatar = rateLimit({ windowMs: 60 * MIN, max: 20, key: (req) => req.user.id });
+const isJpeg = (b) => b.length > 4 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+
+function announceAvatar(user, v) {
+  for (const login of new Set([user.login, ...watchersOf(user.id)])) push(login, { type: 'avatar', login: user.login, v });
+}
+
+app.get('/api/avatars', auth, (req, res) => {
+  res.json(Object.fromEntries(q.avatarVersions.all(req.user.id).map((r) => [r.login, r.v])));
+});
+
+app.get('/api/avatars/:login', auth, (req, res) => {
+  const row = q.avatarOf.get(req.params.login);
+  if (!row) return res.status(404).json({ error: 'Sem avatar' });
+  // `?v=` muda a cada troca, então o navegador pode guardar por bastante tempo
+  res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=604800', 'X-Content-Type-Options': 'nosniff' });
+  res.send(Buffer.from(row.avatar));
+});
+
+app.put('/api/avatar', auth, limitAvatar, express.raw({ type: () => true, limit: MAX_AVATAR_BYTES }), (req, res) => {
+  if (!Buffer.isBuffer(req.body) || !isJpeg(req.body)) return res.status(400).json({ error: 'Imagem inválida' });
+  const v = Date.now();
+  q.setAvatar.run(req.body, v, req.user.id);
+  announceAvatar(req.user, v);
+  res.json({ v });
+});
+
+app.delete('/api/avatar', auth, limitAvatar, (req, res) => {
+  q.setAvatar.run(null, null, req.user.id);
+  announceAvatar(req.user, null);
+  res.json({});
+});
+
+app.get('/api/presence', auth, (req, res) => res.json([...watchersOf(req.user.id)].filter((l) => sockets.has(l))));
 app.get('/api/friends', auth, (req, res) => res.json(q.friendsOf.all(req.user.id).map((r) => r.login)));
 app.get('/api/requests', auth, (req, res) => res.json(q.incomingRequests.all(req.user.id).map((r) => r.login)));
 app.get('/api/blocks', auth, (req, res) => res.json(q.blocksOf.all(req.user.id).map((r) => r.login)));
@@ -503,8 +805,11 @@ function makeFriends(a, b) {
 
 // Envia um pedido de amizade; se a outra pessoa já tinha pedido, vira amizade.
 app.post('/api/friends', auth, limitFriendRequests, (req, res) => {
-  const target = typeof req.body?.login === 'string' && q.userByLogin.get(req.body.login);
-  if (!target) return res.status(404).json({ error: 'Usuário não encontrado' });
+  // O pedido é feito pelo e-mail da pessoa (o nome de usuário não serve para encontrá-la).
+  const email = normEmail(req.body?.email);
+  if (!email) return res.status(400).json({ error: 'E-mail inválido' });
+  const target = q.userByEmail.get(email);
+  if (!target || !target.email_verified_at) return res.status(404).json({ error: 'Nenhum usuário com esse e-mail' });
   if (target.id === req.user.id) return res.status(400).json({ error: 'Você não pode adicionar a si mesmo' });
   if (q.areFriends.get(req.user.id, target.id)) return res.json({ status: 'friends' });
   if (q.isBlocked.get(req.user.id, target.id)) {
@@ -586,130 +891,259 @@ function friendOf(req, res) {
   return friend;
 }
 
+// Uma conversa é um amigo (mensagem direta) ou um servidor, e os mesmos endpoints de canais e mensagens
+// servem às duas. `req.ctx` diz qual é: o `conv` das tabelas, quem pode administrar e como avisar
+// os participantes em tempo real.
+function dmCtx(req, res, next) {
+  const friend = friendOf(req, res);
+  if (!friend) return;
+  req.ctx = {
+    conv: convKey(req.user.id, friend.id),
+    friend,
+    server: null,
+    canManage: true,
+    emit(event) {
+      push(req.user.login, { ...event, with: friend.login });
+      push(friend.login, { ...event, with: req.user.login });
+    },
+  };
+  next();
+}
+
+function serverCtx(req, res, next) {
+  const server = q.serverById.get(req.params.sid);
+  if (!server || !q.isMember.get(server.id, req.user.id)) return res.status(404).json({ error: 'Servidor não encontrado' });
+  req.ctx = {
+    conv: serverConv(server.id),
+    friend: null,
+    server,
+    canManage: server.owner_id === req.user.id,
+    emit(event) {
+      for (const m of q.membersOf.all(server.id)) push(m.login, { ...event, server: server.id });
+    },
+  };
+  next();
+}
+
+const ownerOnly = (req, res, next) => {
+  if (req.ctx.canManage) return next();
+  res.status(403).json({ error: 'Só o dono do servidor pode fazer isso' });
+};
+
 // Canal pedido (?channel=...); sem o parâmetro vale o padrão. Responde 404 se não existir na conversa.
-function channelOf(req, res, friend) {
+function channelOf(req, res) {
   const id = req.query.channel ?? req.body?.channel ?? MAIN_CHANNEL.id;
-  if (typeof id === 'string' && (id === MAIN_CHANNEL.id || q.channelExists.get(id, convKey(req.user.id, friend.id)))) {
-    return id;
-  }
+  if (typeof id === 'string' && (id === MAIN_CHANNEL.id || q.channelExists.get(id, req.ctx.conv))) return id;
   res.status(404).json({ error: 'Canal não encontrado' });
   return null;
 }
 
-app.get('/api/channels/:friend', auth, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  res.json([MAIN_CHANNEL, ...q.channelsOf.all(convKey(req.user.id, friend.id))]);
-});
-
-app.post('/api/channels/:friend', auth, limitChannels, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const name = typeof req.body?.name === 'string' ? req.body.name.trim().replace(/^#+/, '').trim() : '';
-  if (name === '' || name.length > MAX_CHANNEL_NAME || CONTROL_CHARS.test(name)) {
-    return res.status(400).json({ error: `Nome de canal inválido (até ${MAX_CHANNEL_NAME} caracteres)` });
-  }
-  const conv = convKey(req.user.id, friend.id);
-  if (name.toLowerCase() === MAIN_CHANNEL.name || q.channelByName.get(conv, name)) {
-    return res.status(409).json({ error: 'Já existe um canal com esse nome' });
-  }
-  if (q.countChannels.get(conv).n >= MAX_CHANNELS) {
-    return res.status(400).json({ error: `Limite de ${MAX_CHANNELS} canais por conversa` });
-  }
-  const channel = { id: crypto.randomUUID(), name };
-  q.insertChannel.run(channel.id, conv, name, req.user.id);
-  push(req.user.login, { type: 'channels', with: friend.login });
-  push(friend.login, { type: 'channels', with: req.user.login });
-  res.json(channel);
-});
-
-// Apaga o canal e as mensagens dele, para os dois lados. O canal padrão não pode ser apagado.
-app.delete('/api/channels/:friend/:id', auth, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const conv = convKey(req.user.id, friend.id);
-  if (req.params.id === MAIN_CHANNEL.id) return res.status(400).json({ error: 'O canal #geral não pode ser apagado' });
-  if (!q.channelExists.get(req.params.id, conv)) return res.status(404).json({ error: 'Canal não encontrado' });
-  tx(() => {
-    wipeChannelMessages(conv, req.params.id);
-    q.deleteChannel.run(req.params.id, conv);
+const CHANNEL_SCOPES = [['/api/channels/:friend', dmCtx], ['/api/servers/:sid/channels', serverCtx]];
+for (const [base, scope] of CHANNEL_SCOPES) {
+  app.get(base, auth, scope, (req, res) => {
+    res.json([MAIN_CHANNEL, ...q.channelsOf.all(req.ctx.conv)]);
   });
-  push(req.user.login, { type: 'channels', with: friend.login });
-  push(friend.login, { type: 'channels', with: req.user.login });
-  res.json({});
-});
+
+  app.post(base, auth, scope, ownerOnly, limitChannels, (req, res) => {
+    const { conv } = req.ctx;
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim().replace(/^#+/, '').trim() : '';
+    if (name === '' || name.length > MAX_CHANNEL_NAME || CONTROL_CHARS.test(name)) {
+      return res.status(400).json({ error: `Nome de canal inválido (até ${MAX_CHANNEL_NAME} caracteres)` });
+    }
+    if (name.toLowerCase() === MAIN_CHANNEL.name || q.channelByName.get(conv, name)) {
+      return res.status(409).json({ error: 'Já existe um canal com esse nome' });
+    }
+    if (q.countChannels.get(conv).n >= MAX_CHANNELS) {
+      return res.status(400).json({ error: `Limite de ${MAX_CHANNELS} canais por conversa` });
+    }
+    const channel = { id: crypto.randomUUID(), name };
+    q.insertChannel.run(channel.id, conv, name, req.user.id);
+    req.ctx.emit({ type: 'channels' });
+    res.json(channel);
+  });
+
+  // Apaga o canal e as mensagens dele, para todos. O canal padrão não pode ser apagado.
+  app.delete(`${base}/:id`, auth, scope, ownerOnly, (req, res) => {
+    const { conv } = req.ctx;
+    if (req.params.id === MAIN_CHANNEL.id) return res.status(400).json({ error: 'O canal #geral não pode ser apagado' });
+    if (!q.channelExists.get(req.params.id, conv)) return res.status(404).json({ error: 'Canal não encontrado' });
+    tx(() => {
+      wipeChannelMessages(conv, req.params.id);
+      q.deleteChannel.run(req.params.id, conv);
+    });
+    req.ctx.emit({ type: 'channels' });
+    res.json({});
+  });
+}
+
+
+// ---------- arquivos cifrados (vídeo/GIF) ----------
+// O navegador cifra em blocos e envia em partes sequenciais (PUT ?offset=&final=); cada parte é
+// anexada ao arquivo em disco. O arquivo só fica disponível depois da última parte e some junto
+// com a mensagem, o canal ou a conversa. O servidor nunca vê o conteúdo nem a chave.
+const FILE_SCOPES = [['/api/files/:friend', dmCtx], ['/api/servers/:sid/files', serverCtx]];
+const limitUpload = rateLimit({ windowMs: MIN, max: 600, key: (req) => req.user.id });
+
+for (const [base, scope] of FILE_SCOPES) {
+  app.put(`${base}/:fid`, auth, scope, limitUpload, ah(async (req, res) => {
+    const { conv } = req.ctx;
+    const { fid } = req.params;
+    if (!UUID_RE.test(fid)) return res.status(400).json({ error: 'Arquivo inválido' });
+    const channel = channelOf(req, res);
+    if (!channel) return;
+    const offset = Number(req.query.offset);
+    const final = req.query.final === '1';
+    if (!req.headers['content-length']) return res.status(411).json({ error: 'Tamanho obrigatório' });
+    const len = Number(req.headers['content-length']);
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(len) || len < 1 || len > MAX_PART_BYTES || offset + len > MAX_FILE_STORED) {
+      return res.status(400).json({ error: 'Parte inválida' });
+    }
+    let row = q.fileById.get(fid);
+    if (row && (row.user_id !== req.user.id || row.conv !== conv || row.complete)) {
+      return res.status(409).json({ error: 'Arquivo já existe' });
+    }
+    if (!row) {
+      if (offset !== 0) return res.status(409).json({ error: 'Envio fora de ordem' });
+      if (q.pendingFilesOf.get(req.user.id).n >= MAX_PENDING_FILES) {
+        return res.status(429).json({ error: 'Muitos envios em andamento' });
+      }
+      q.insertFile.run(fid, conv, channel, req.user.id, Date.now());
+      row = { size: 0 };
+    } else if (offset > row.size) {
+      return res.status(409).json({ error: 'Envio fora de ordem' });
+    }
+    if (q.fileBytesOf.get(req.user.id).n - row.size + offset + len > MAX_USER_FILE_BYTES) {
+      return res.status(413).json({ error: 'Limite de armazenamento de arquivos atingido' });
+    }
+    const target = path.join(FILES_DIR, fid);
+    try {
+      // retentativa de uma parte: descarta o que sobrou de uma tentativa que caiu no meio
+      await fsp.truncate(target, offset).catch((err) => { if (err.code !== 'ENOENT') throw err; });
+      let got = 0;
+      req.on('data', (c) => { got += c.length; });
+      await pipeline(req, fs.createWriteStream(target, { flags: 'a' }));
+      if (got !== len) throw new Error('parte incompleta');
+    } catch (err) {
+      if (!res.headersSent) res.status(400).json({ error: 'Falha ao receber a parte' });
+      return;
+    }
+    const size = offset + len;
+    if (final) {
+      const chunks = Math.ceil(size / (FILE_CHUNK + GCM_OVERHEAD));
+      if (size - chunks * GCM_OVERHEAD < 1) {
+        q.deleteFile.run(fid);
+        fs.unlink(target, () => {});
+        return res.status(400).json({ error: 'Arquivo inválido' });
+      }
+    }
+    q.setFileProgress.run(size, final ? 1 : 0, Date.now(), fid);
+    res.json({});
+  }));
+
+  // Devolve os bytes cifrados (com suporte a Range); só para quem participa da conversa.
+  app.get(`${base}/:fid`, auth, scope, limitRead, (req, res) => {
+    const row = UUID_RE.test(req.params.fid) ? q.fileById.get(req.params.fid) : null;
+    if (!row || row.conv !== req.ctx.conv || !row.complete) return res.status(404).json({ error: 'Arquivo não encontrado' });
+    res.sendFile(row.id, {
+      root: FILES_DIR,
+      dotfiles: 'deny',
+      cacheControl: false,
+      headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'private, no-store' },
+    }, (err) => {
+      if (err && !res.headersSent) res.status(404).json({ error: 'Arquivo não encontrado' });
+    });
+  });
+}
 
 const PAGE_SIZE = 50;
+const MESSAGE_SCOPES = [['/api/messages/:friend', dmCtx], ['/api/servers/:sid/messages', serverCtx]];
 
-// Últimas mensagens do canal; com ?before=<seq> devolve a página anterior (rolagem para cima).
-// `read` = até que seq a outra pessoa já leu (para os "visto").
-app.get('/api/messages/:friend', auth, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const channel = channelOf(req, res, friend);
-  if (!channel) return;
-  const conv = convKey(req.user.id, friend.id);
-  const before = req.query.before === undefined ? Number.MAX_SAFE_INTEGER : Number(req.query.before);
-  if (!Number.isInteger(before) || before < 0) return res.status(400).json({ error: 'Cursor inválido' });
-  const rows = q.messagesPage.all(conv, channel, before, PAGE_SIZE + 1);
-  const hasMore = rows.length > PAGE_SIZE;
-  const page = rows.slice(0, PAGE_SIZE).reverse();
-  const reactions = page.length
-    ? groupReactions(q.reactionsInRange.all(conv, channel, page[0].seq, page[page.length - 1].seq))
-    : new Map();
-  res.json({
-    messages: page.map((m) => ({ ...m, reactions: reactions.get(m.id) ?? [] })),
-    hasMore,
-    read: q.readOf.get(conv, channel, friend.id)?.seq ?? 0,
+for (const [base, scope] of MESSAGE_SCOPES) {
+  // Últimas mensagens do canal; com ?before=<seq> devolve a página anterior (rolagem para cima).
+  // `read` = até que seq a outra pessoa já leu (para os "visto"); não existe em servidores.
+  app.get(base, auth, scope, (req, res) => {
+    const { conv, friend, server } = req.ctx;
+    const channel = channelOf(req, res);
+    if (!channel) return;
+    const before = req.query.before === undefined ? Number.MAX_SAFE_INTEGER : Number(req.query.before);
+    if (!Number.isInteger(before) || before < 0) return res.status(400).json({ error: 'Cursor inválido' });
+    const rows = q.messagesPage.all(conv, channel, before, PAGE_SIZE + 1);
+    const hasMore = rows.length > PAGE_SIZE;
+    const page = rows.slice(0, PAGE_SIZE).reverse();
+    const reactions = page.length
+      ? groupReactions(q.reactionsInRange.all(conv, channel, page[0].seq, page[page.length - 1].seq))
+      : new Map();
+    res.json({
+      messages: page.map((m) => ({ ...m, ...(server && { server: server.id }), reactions: reactions.get(m.id) ?? [] })),
+      hasMore,
+      read: friend ? q.readOf.get(conv, channel, friend.id)?.seq ?? 0 : 0,
+    });
   });
-});
 
-// Marca como lido (até o seq informado) o que a outra pessoa enviou; avisa quem enviou.
-app.post('/api/messages/:friend/read', auth, limitRead, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const channel = channelOf(req, res, friend);
-  if (!channel) return;
-  const conv = convKey(req.user.id, friend.id);
-  const asked = Number(req.body?.seq);
-  if (!Number.isInteger(asked) || asked < 0) return res.status(400).json({ error: 'Marca inválida' });
-  const seq = Math.min(asked, q.maxSeq.get(conv, channel).n ?? 0);
-  if (seq > (q.readOf.get(conv, channel, req.user.id)?.seq ?? 0)) {
-    q.upsertRead.run(conv, channel, req.user.id, seq);
-    push(friend.login, { type: 'read', with: req.user.login, channel, seq });
-  }
-  res.json({});
-});
+  // Marca como lido (até o seq informado) o que a outra pessoa enviou; avisa quem enviou.
+  app.post(`${base}/read`, auth, scope, limitRead, (req, res) => {
+    const { conv, friend } = req.ctx;
+    const channel = channelOf(req, res);
+    if (!channel) return;
+    const asked = Number(req.body?.seq);
+    if (!Number.isInteger(asked) || asked < 0) return res.status(400).json({ error: 'Marca inválida' });
+    const seq = Math.min(asked, q.maxSeq.get(conv, channel).n ?? 0);
+    if (seq > (q.readOf.get(conv, channel, req.user.id)?.seq ?? 0)) {
+      q.upsertRead.run(conv, channel, req.user.id, seq);
+      if (friend) push(friend.login, { type: 'read', with: req.user.login, channel, seq });
+    }
+    res.json({});
+  });
 
-// `data` já chega criptografado (AES-GCM) pelo navegador; o servidor nunca vê o texto.
-app.post('/api/messages/:friend', auth, limitSend, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const channel = channelOf(req, res, friend);
-  if (!channel) return;
-  const { data } = req.body ?? {};
-  if (typeof data !== 'string' || data === '' || data.length > MAX_CIPHERTEXT) {
-    return res.status(400).json({ error: 'Mensagem inválida' });
-  }
-  const msg = { id: crypto.randomUUID(), channel, from: req.user.login, to: friend.login, data, ts: Date.now(), reactions: [] };
-  msg.seq = Number(q.insertMessage.run(msg.id, convKey(req.user.id, friend.id), channel, req.user.id, friend.id, data, msg.ts).lastInsertRowid);
-  push(msg.from, { type: 'message', message: msg });
-  push(msg.to, { type: 'message', message: msg });
-  pushNotify(friend.id, { type: 'message', from: msg.from, channel });
-  res.json(msg);
-});
+  // `data` já chega criptografado (AES-GCM) pelo navegador; o servidor nunca vê o texto.
+  app.post(base, auth, scope, limitSend, (req, res) => {
+    const { conv, friend, server } = req.ctx;
+    const channel = channelOf(req, res);
+    if (!channel) return;
+    const { data, file } = req.body ?? {};
+    if (typeof data !== 'string' || data === '' || data.length > MAX_CIPHERTEXT) {
+      return res.status(400).json({ error: 'Mensagem inválida' });
+    }
+    let fileRow = null;
+    if (file !== undefined) {
+      fileRow = typeof file === 'string' && UUID_RE.test(file) ? q.fileById.get(file) : null;
+      if (!fileRow || fileRow.user_id !== req.user.id || fileRow.conv !== conv || fileRow.channel !== channel || !fileRow.complete || fileRow.message_id) {
+        return res.status(400).json({ error: 'Arquivo inválido' });
+      }
+    }
+    const msg = {
+      id: crypto.randomUUID(),
+      channel,
+      from: req.user.login,
+      to: friend ? friend.login : null,
+      ...(server && { server: server.id }),
+      data,
+      ts: Date.now(),
+      reactions: [],
+    };
+    tx(() => {
+      msg.seq = Number(q.insertMessage.run(msg.id, conv, channel, req.user.id, friend ? friend.id : 0, data, msg.ts).lastInsertRowid);
+      if (fileRow) q.linkFile.run(msg.id, fileRow.id);
+    });
+    req.ctx.emit({ type: 'message', message: msg });
+    if (friend) pushNotify(friend.id, { type: 'message', from: msg.from, channel });
+    else {
+      for (const m of q.membersOf.all(server.id)) {
+        if (m.id !== req.user.id) pushNotify(m.id, { type: 'message', from: msg.from, channel, server: server.id, serverName: server.name });
+      }
+    }
+    res.json(msg);
+  });
 
-// Apaga todas as mensagens do canal para os dois lados, de forma permanente.
-app.delete('/api/messages/:friend', auth, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const channel = channelOf(req, res, friend);
-  if (!channel) return;
-  tx(() => wipeChannelMessages(convKey(req.user.id, friend.id), channel));
-  push(req.user.login, { type: 'cleared', with: friend.login, channel });
-  push(friend.login, { type: 'cleared', with: req.user.login, channel });
-  res.json({});
-});
+  // Apaga todas as mensagens do canal para todos, de forma permanente (em servidor, só o dono).
+  app.delete(base, auth, scope, ownerOnly, (req, res) => {
+    const channel = channelOf(req, res);
+    if (!channel) return;
+    tx(() => wipeChannelMessages(req.ctx.conv, channel));
+    req.ctx.emit({ type: 'cleared', channel });
+    res.json({});
+  });
+}
 
 // Transcrição de áudio (Whisper, CPU). O áudio chega em claro (o navegador o decifra/grava localmente),
 // é repassado ao serviço interno só na memória e descartado: nada é salvo nem registrado aqui.
@@ -741,50 +1175,162 @@ app.post('/api/transcribe', auth, limitTranscribe, express.raw({ type: () => tru
   }
 }));
 
-// O autor troca o conteúdo cifrado da própria mensagem por pouco tempo: é como o áudio recebe a
-// transcrição depois de já ter sido enviado.
+// O autor troca o conteúdo cifrado da própria mensagem. Sem `edited` é o ajuste automático do áudio
+// (a transcrição chega depois do envio), só por pouco tempo; com `edited` é uma edição do autor, que
+// vale a qualquer momento e marca a mensagem como editada.
 const MAX_EDIT_AGE_MS = 10 * 60 * 1000;
-app.patch('/api/messages/:friend/:id', auth, limitSend, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const row = q.messageOwner.get(req.params.id, convKey(req.user.id, friend.id));
-  if (!row || row.from_id !== req.user.id) return res.status(404).json({ error: 'Mensagem não encontrada' });
-  if (Date.now() - row.ts > MAX_EDIT_AGE_MS) return res.status(400).json({ error: 'Tempo para editar esgotado' });
-  const { data } = req.body ?? {};
-  if (typeof data !== 'string' || data === '' || data.length > MAX_CIPHERTEXT) {
-    return res.status(400).json({ error: 'Mensagem inválida' });
+
+for (const [base, scope] of MESSAGE_SCOPES) {
+  app.patch(`${base}/:id`, auth, scope, limitSend, (req, res) => {
+    const row = q.messageOwner.get(req.params.id, req.ctx.conv);
+    if (!row || row.from_id !== req.user.id) return res.status(404).json({ error: 'Mensagem não encontrada' });
+    const userEdit = req.body?.edited === true;
+    if (!userEdit && Date.now() - row.ts > MAX_EDIT_AGE_MS) return res.status(400).json({ error: 'Tempo para editar esgotado' });
+    const { data } = req.body ?? {};
+    if (typeof data !== 'string' || data === '' || data.length > MAX_CIPHERTEXT) {
+      return res.status(400).json({ error: 'Mensagem inválida' });
+    }
+    const edited = userEdit ? Date.now() : null;
+    if (userEdit) q.updateMessageEdited.run(data, edited, req.params.id);
+    else q.updateMessageData.run(data, req.params.id);
+    req.ctx.emit({ type: 'edited', id: req.params.id, channel: row.channel, data, ...(edited && { edited }) });
+    res.json({});
+  });
+
+  // O autor apaga a própria mensagem; o dono do servidor apaga qualquer uma do servidor.
+  app.delete(`${base}/:id`, auth, scope, limitSend, (req, res) => {
+    const row = q.messageOwner.get(req.params.id, req.ctx.conv);
+    if (!row) return res.status(404).json({ error: 'Mensagem não encontrada' });
+    if (row.from_id !== req.user.id && !(req.ctx.server && req.ctx.canManage)) {
+      return res.status(403).json({ error: 'Você só pode apagar suas mensagens' });
+    }
+    tx(() => {
+      q.deleteReactionsOfMessage.run(req.params.id);
+      dropFiles(q.fileIdsOfMessage, q.deleteFilesOfMessage, req.params.id);
+      q.deleteMessage.run(req.params.id);
+    });
+    req.ctx.emit({ type: 'deleted', id: req.params.id, channel: row.channel });
+    res.json({});
+  });
+
+  // Alterna a reação do usuário (adiciona se não tinha, remove se já tinha), como no Discord.
+  app.post(`${base}/:id/reactions`, auth, scope, limitSend, (req, res) => {
+    const row = q.messageChannel.get(req.params.id, req.ctx.conv);
+    if (!row) return res.status(404).json({ error: 'Mensagem não encontrada' });
+    const { emoji } = req.body ?? {};
+    if (typeof emoji !== 'string' || emoji.length > 16 || !EMOJI_RE.test(emoji)) {
+      return res.status(400).json({ error: 'Emoji inválido' });
+    }
+    if (q.hasReaction.get(req.params.id, req.user.id, emoji)) {
+      q.deleteReaction.run(req.params.id, req.user.id, emoji);
+    } else {
+      const distinct = q.reactionsOfMessage.all(req.params.id).some((r) => r.emoji === emoji);
+      if (!distinct && q.countEmojis.get(req.params.id).n >= MAX_EMOJIS_PER_MESSAGE) {
+        return res.status(400).json({ error: 'Limite de reações diferentes nesta mensagem' });
+      }
+      q.insertReaction.run(req.params.id, req.user.id, emoji);
+    }
+    const reactions = groupReactions(q.reactionsOfMessage.all(req.params.id)).get(req.params.id) ?? [];
+    req.ctx.emit({ type: 'reactions', id: req.params.id, channel: row.channel, reactions });
+    res.json({ reactions });
+  });
+}
+
+// ---------- servidores ----------
+// Um servidor tem dono, membros e canais (tabela `channels`, com conv `s:<id>`). As mensagens usam
+// as mesmas rotas e a mesma criptografia das conversas diretas, com uma chave por servidor.
+const MAX_SERVERS_PER_USER = 50; // servidores em que a pessoa participa
+const MAX_OWNED_SERVERS = 10;
+const MAX_SERVER_MEMBERS = 100;
+const MAX_SERVER_NAME = 32;
+const COLOR_RE = /^#[0-9a-f]{6}$/i;
+
+const serverInfo = (s) => ({ id: s.id, name: s.name, icon: s.icon, color: s.color, owner: s.owner });
+const notifyServers = (logins) => {
+  for (const login of new Set(logins)) push(login, { type: 'servers' });
+};
+
+app.get('/api/servers', auth, (req, res) => res.json(q.serversOf.all(req.user.id).map(serverInfo)));
+
+app.post('/api/servers', auth, limitServers, (req, res) => {
+  const { name, icon = '', color } = req.body ?? {};
+  const clean = typeof name === 'string' ? name.trim() : '';
+  if (clean === '' || clean.length > MAX_SERVER_NAME || CONTROL_CHARS.test(clean)) {
+    return res.status(400).json({ error: `Nome inválido (até ${MAX_SERVER_NAME} caracteres)` });
   }
-  q.updateMessageData.run(data, req.params.id);
-  const event = { type: 'edited', id: req.params.id, channel: row.channel, data };
-  push(req.user.login, { ...event, with: friend.login });
-  push(friend.login, { ...event, with: req.user.login });
+  if (typeof icon !== 'string' || (icon !== '' && (icon.length > 16 || !EMOJI_RE.test(icon)))) {
+    return res.status(400).json({ error: 'Ícone inválido' });
+  }
+  if (typeof color !== 'string' || !COLOR_RE.test(color)) return res.status(400).json({ error: 'Cor inválida' });
+  if (q.countOwnedServers.get(req.user.id).n >= MAX_OWNED_SERVERS) {
+    return res.status(400).json({ error: `Limite de ${MAX_OWNED_SERVERS} servidores criados` });
+  }
+  if (q.countServersOf.get(req.user.id).n >= MAX_SERVERS_PER_USER) {
+    return res.status(400).json({ error: `Limite de ${MAX_SERVERS_PER_USER} servidores` });
+  }
+  const server = { id: crypto.randomUUID(), name: clean, icon, color: color.toLowerCase(), owner: req.user.login };
+  tx(() => {
+    q.insertServer.run(server.id, server.name, server.icon, server.color, req.user.id);
+    q.addMember.run(server.id, req.user.id);
+  });
+  push(req.user.login, { type: 'servers' });
+  res.json(server);
+});
+
+app.get('/api/servers/:sid', auth, serverCtx, (req, res) => {
+  const { server } = req.ctx;
+  res.json({
+    ...serverInfo({ ...server, owner: q.userById.get(server.owner_id).login }),
+    members: q.membersOf.all(server.id).map((m) => m.login),
+  });
+});
+
+// Só o dono adiciona, e só amigos dele (quem bloqueou o dono não é amigo, então fica de fora).
+app.post('/api/servers/:sid/members', auth, serverCtx, ownerOnly, limitMembers, (req, res) => {
+  const { server } = req.ctx;
+  const target = typeof req.body?.login === 'string' && q.userByLogin.get(req.body.login);
+  if (!target) return res.status(404).json({ error: 'Usuário não encontrado' });
+  if (!q.areFriends.get(req.user.id, target.id)) {
+    return res.status(400).json({ error: 'Só é possível adicionar amigos ao servidor' });
+  }
+  if (q.isMember.get(server.id, target.id)) return res.status(409).json({ error: 'Já está no servidor' });
+  if (q.countMembers.get(server.id).n >= MAX_SERVER_MEMBERS) {
+    return res.status(400).json({ error: `Limite de ${MAX_SERVER_MEMBERS} membros` });
+  }
+  if (q.countServersOf.get(target.id).n >= MAX_SERVERS_PER_USER) {
+    return res.status(400).json({ error: 'Este usuário já participa de servidores demais' });
+  }
+  q.addMember.run(server.id, target.id);
+  notifyServers(q.membersOf.all(server.id).map((m) => m.login));
   res.json({});
 });
 
-// Alterna a reação do usuário (adiciona se não tinha, remove se já tinha), como no Discord.
-app.post('/api/messages/:friend/:id/reactions', auth, limitSend, (req, res) => {
-  const friend = friendOf(req, res);
-  if (!friend) return;
-  const row = q.messageChannel.get(req.params.id, convKey(req.user.id, friend.id));
-  if (!row) return res.status(404).json({ error: 'Mensagem não encontrada' });
-  const { emoji } = req.body ?? {};
-  if (typeof emoji !== 'string' || emoji.length > 16 || !EMOJI_RE.test(emoji)) {
-    return res.status(400).json({ error: 'Emoji inválido' });
-  }
-  if (q.hasReaction.get(req.params.id, req.user.id, emoji)) {
-    q.deleteReaction.run(req.params.id, req.user.id, emoji);
-  } else {
-    const distinct = q.reactionsOfMessage.all(req.params.id).some((r) => r.emoji === emoji);
-    if (!distinct && q.countEmojis.get(req.params.id).n >= MAX_EMOJIS_PER_MESSAGE) {
-      return res.status(400).json({ error: 'Limite de reações diferentes nesta mensagem' });
-    }
-    q.insertReaction.run(req.params.id, req.user.id, emoji);
-  }
-  const reactions = groupReactions(q.reactionsOfMessage.all(req.params.id)).get(req.params.id) ?? [];
-  const event = { type: 'reactions', id: req.params.id, channel: row.channel, reactions };
-  push(req.user.login, { ...event, with: friend.login });
-  push(friend.login, { ...event, with: req.user.login });
-  res.json({ reactions });
+// O dono remove qualquer membro; cada um pode sair sozinho. O dono não sai: apaga o servidor.
+app.delete('/api/servers/:sid/members/:login', auth, serverCtx, (req, res) => {
+  const { server, canManage } = req.ctx;
+  const target = q.userByLogin.get(req.params.login);
+  if (!target || !q.isMember.get(server.id, target.id)) return res.status(404).json({ error: 'Membro não encontrado' });
+  if (target.id === server.owner_id) return res.status(400).json({ error: 'O dono não pode sair; apague o servidor' });
+  if (target.id !== req.user.id && !canManage) return res.status(403).json({ error: 'Só o dono do servidor pode fazer isso' });
+  const logins = q.membersOf.all(server.id).map((m) => m.login);
+  tx(() => {
+    q.removeMember.run(server.id, target.id);
+    q.deleteReadsOfUser.run(serverConv(server.id), target.id);
+  });
+  notifyServers(logins);
+  res.json({});
+});
+
+app.delete('/api/servers/:sid', auth, serverCtx, ownerOnly, (req, res) => {
+  const { server, conv } = req.ctx;
+  const logins = q.membersOf.all(server.id).map((m) => m.login);
+  wipeConversation(conv);
+  tx(() => {
+    q.deleteServerMembers.run(server.id);
+    q.deleteServer.run(server.id);
+  });
+  notifyServers(logins);
+  res.json({});
 });
 
 // ---------- GIFs (Klipy) ----------
@@ -859,7 +1405,7 @@ app.post('/api/call/:friend', auth, limitCall, (req, res) => {
 });
 
 // Só serviços de push conhecidos: o servidor faz requisições ao endpoint informado.
-const PUSH_HOSTS = /^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|[\w.-]+\.push\.apple\.com|[\w.-]+\.notify\.windows\.com)$/;
+const PUSH_HOSTS = /^(fcm\.googleapis\.com|jmt17\.google\.com|([\w-]+\.)*push\.services\.mozilla\.com|([\w-]+\.)*push\.apple\.com|([\w-]+\.)*notify\.windows\.com)$/;
 const MAX_PUSH_SUBS = 10;
 
 app.get('/api/push/key', auth, (req, res) => res.json({ key: VAPID_PUBLIC }));
@@ -876,7 +1422,7 @@ app.post('/api/push/subscribe', auth, limitRead, (req, res) => {
     typeof keys?.p256dh !== 'string' || keys.p256dh.length > 200 ||
     typeof keys?.auth !== 'string' || keys.auth.length > 100
   ) {
-    return res.status(400).json({ error: 'Inscrição inválida' });
+    return res.status(400).json({ error: `Inscrição inválida${host ? ` (${host})` : ''}` });
   }
   if (q.countPushSubs.get(req.user.id).n >= MAX_PUSH_SUBS) q.dropOldestPushSub.run(req.user.id);
   q.upsertPushSub.run(endpoint, req.user.id, keys.p256dh, keys.auth);
